@@ -161,6 +161,10 @@ public:
 
   const char *getNodeName();
   NodePrefs *getNodePrefs();
+#ifdef WADAMESH_RXPS
+  /** Run an RXPS radio command directly from the local UI without emitting a chat reply. */
+  bool uiRadioRxpsCommand(const char* command, char* reply, size_t reply_size);
+#endif
   uint32_t getBLEPin();
   bool     setBLEPin(uint32_t pin);   // user-chosen 6-digit pairing code (persisted; applies next boot)
   uint32_t getOrphanedBlobs() const { return _orphaned_blobs; }   // see PENDING_DEL_MAX (#222)
@@ -1508,7 +1512,7 @@ private:
   // The companion CLI (MeshCore 1.18): app v1.50's Command Line, the serial CLI's
   // fall-through and the remote CLI of contacts granted that permission.
   bool handleCommand(const char* text, uint32_t sender_timestamp, char* reply);
-  bool handleRadioCommand(const char* command, char* reply);
+  bool handleRadioCommand(const char* command, char* reply, size_t reply_size = 158);
   bool printSharedCliReply();
 #if defined(ESP32)
   // Serial sideload state ("fput" / "fadd" / "fend"): the file being written.

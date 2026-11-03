@@ -16407,6 +16407,114 @@ static void telemLocExactToggleCb(lv_event_t* e) {
 // The airtime readout under the radio fields, from the saved PHY settings: the duty
 // cycle the airtime factor allows and one packet's time on air. Refreshed whenever the
 // radio is applied, so picking a preset updates it in place.
+#ifdef WADAMESH_RXPS
+static lv_obj_t* s_radio_rxps_custom_box = nullptr;
+static lv_obj_t* s_radio_rxps_rx_ta = nullptr;
+static lv_obj_t* s_radio_rxps_sleep_ta = nullptr;
+static lv_obj_t* s_radio_rxps_status = nullptr;
+static lv_obj_t* s_radio_rxps_mode = nullptr;
+
+static int radioRxpsModeIndex(const NodePrefs* p) {
+  if (!p || !p->rxps_enabled) return 0;
+  if (p->rxps_level == 6 && p->rxps_preamble) return 1;
+  if (p->rxps_level == 3 && p->rxps_preamble) return 2;
+  return 3;
+}
+static void radioRxpsRefresh() {
+  if (!s_radio_rxps_status || !lv_obj_is_valid(s_radio_rxps_status)) return;
+  char reply[158] = {0};
+  if (the_mesh.uiRadioRxpsCommand("get radio.rxps", reply, sizeof(reply))) {
+    if (strstr(reply, "supported=no")) {
+      lv_label_set_text(s_radio_rxps_status, TR("Unsupported"));
+    } else if (strstr(reply, "effective=armed")) {
+      lv_label_set_text(s_radio_rxps_status, TR("Armed"));
+    } else if (strstr(reply, "desired=on")) {
+      lv_label_set_text(s_radio_rxps_status, TR("On; continuous RX"));
+    } else {
+      lv_label_set_text(s_radio_rxps_status, TR("Off; continuous RX"));
+    }
+  }
+}
+static void radioRxpsModeChangedCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  lv_obj_t* dd = lv_event_get_target(e);
+  const uint16_t idx = lv_dropdown_get_selected(dd);
+  if (s_radio_rxps_custom_box && lv_obj_is_valid(s_radio_rxps_custom_box)) {
+    if (idx == 3) lv_obj_clear_flag(s_radio_rxps_custom_box, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(s_radio_rxps_custom_box, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (idx == 3) {
+    // Refresh persisted periods when switching back from a named profile.
+    NodePrefs* p = the_mesh.getNodePrefs();
+    if (p && s_radio_rxps_rx_ta && s_radio_rxps_sleep_ta) {
+      char value[16];
+      snprintf(value, sizeof(value), "%lu", (unsigned long)p->rxps_rx_us);
+      lv_textarea_set_text(s_radio_rxps_rx_ta, value);
+      snprintf(value, sizeof(value), "%lu", (unsigned long)p->rxps_sleep_us);
+      lv_textarea_set_text(s_radio_rxps_sleep_ta, value);
+    }
+    return;  // Custom timing is applied only after the explicit Apply action.
+  }
+
+  static const char* const commands[] = {
+    "set radio.rxps off", "set radio.rxps balanced", "set radio.rxps conservative"
+  };
+  char reply[158] = {0};
+  if (!the_mesh.uiRadioRxpsCommand(commands[idx < 3 ? idx : 0], reply, sizeof(reply)) ||
+      strncmp(reply, "OK", 2) != 0) {
+    NodePrefs* p = the_mesh.getNodePrefs();
+    const uint16_t restored = (uint16_t)radioRxpsModeIndex(p);
+    lv_dropdown_set_selected(dd, restored);
+    if (s_radio_rxps_custom_box && lv_obj_is_valid(s_radio_rxps_custom_box)) {
+      if (restored == 3) lv_obj_clear_flag(s_radio_rxps_custom_box, LV_OBJ_FLAG_HIDDEN);
+      else lv_obj_add_flag(s_radio_rxps_custom_box, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (g_lv.task) g_lv.task->showAlert(reply[0] ? reply : TR("Could not apply RXPS setting"), 2400);
+  } else if (g_lv.task) {
+    g_lv.task->showAlert(reply, 1600);
+  }
+  radioRxpsRefresh();
+}
+static void radioRxpsApplyCustomCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_radio_rxps_rx_ta || !s_radio_rxps_sleep_ta) return;
+  const char* rx = lv_textarea_get_text(s_radio_rxps_rx_ta);
+  const char* sleep = lv_textarea_get_text(s_radio_rxps_sleep_ta);
+  char command[96], reply[158] = {0};
+  snprintf(command, sizeof(command), "set radio.rxps %s %s", rx ? rx : "", sleep ? sleep : "");
+  if (!the_mesh.uiRadioRxpsCommand(command, reply, sizeof(reply)) || strncmp(reply, "OK", 2) != 0) {
+    if (g_lv.task) g_lv.task->showAlert(reply[0] ? reply : TR("Could not apply RXPS timing"), 2600);
+  } else if (g_lv.task) {
+    // Custom command reply reports validated effective raw periods.
+    g_lv.task->showAlert(reply, 2200);
+  }
+  radioRxpsRefresh();
+}
+static void buildRadioRxps(lv_obj_t* c, const NodePrefs* prefs) {
+  char options[64];
+  snprintf(options, sizeof(options), "%s\n%s\n%s\n%s",
+           TR("Off"), TR("Balanced"), TR("Conservative"), TR("Custom"));
+  s_radio_rxps_mode = setDropdownRow(c, "RX power saving (RXPS)",
+      "Duty-cycles LoRa receive. This is separate from Battery saver.",
+      options, radioRxpsModeIndex(prefs), radioRxpsModeChangedCb);
+  s_radio_rxps_status = setInfoRow(c, "RXPS status", "");
+  s_radio_rxps_custom_box = setBox(c);
+  lv_obj_set_size(s_radio_rxps_custom_box, s_settings_content_w, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(s_radio_rxps_custom_box, LV_FLEX_FLOW_COLUMN);
+  setNote(s_radio_rxps_custom_box, "Set receive and sleep durations in microseconds (1000–30000000). The radio checks timing against current SF/BW.");
+  lv_obj_t* fields = setFieldRow(s_radio_rxps_custom_box);
+  s_radio_rxps_rx_ta = setField(fields, "RX window (µs)", "µs", 8, setFieldW(2));
+  s_radio_rxps_sleep_ta = setField(fields, "Sleep (µs)", "µs", 8, setFieldW(2));
+  char value[16];
+  snprintf(value, sizeof(value), "%lu", (unsigned long)(prefs ? prefs->rxps_rx_us : 65625));
+  lv_textarea_set_text(s_radio_rxps_rx_ta, value);
+  snprintf(value, sizeof(value), "%lu", (unsigned long)(prefs ? prefs->rxps_sleep_us : 60000));
+  lv_textarea_set_text(s_radio_rxps_sleep_ta, value);
+  setActionRow(s_radio_rxps_custom_box, LV_SYMBOL_OK, "Apply custom timing", nullptr, radioRxpsApplyCustomCb);
+  if (radioRxpsModeIndex(prefs) != 3) lv_obj_add_flag(s_radio_rxps_custom_box, LV_OBJ_FLAG_HIDDEN);
+  radioRxpsRefresh();
+}
+#endif
+
 static void radioAirtimeRefresh() {
   NodePrefs* prefs = the_mesh.getNodePrefs();
   lv_obj_t* duty = g_set_modal.radio_duty_val;
@@ -16485,6 +16593,9 @@ static void buildRadioSettings() {
     g_set_modal.radio_duty_val = setInfoRow(c, "Max duty cycle", "");
     g_set_modal.radio_toa_val  = setInfoRow(c, "Time on air", "");
     radioAirtimeRefresh();
+#ifdef WADAMESH_RXPS
+    buildRadioRxps(c, prefs);
+#endif
   }
 
   // What this node answers and what it drops.

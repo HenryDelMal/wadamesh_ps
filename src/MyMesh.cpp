@@ -4306,6 +4306,13 @@ const char *MyMesh::getNodeName() {
 NodePrefs *MyMesh::getNodePrefs() {
   return &_prefs;
 }
+#ifdef WADAMESH_RXPS
+bool MyMesh::uiRadioRxpsCommand(const char* command, char* reply, size_t reply_size) {
+  if (!command || !reply || reply_size == 0) return false;
+  reply[0] = '\0';
+  return handleRadioCommand(command, reply, reply_size);
+}
+#endif
 uint32_t MyMesh::getBLEPin() {
   return _active_ble_pin;
 }
@@ -5872,13 +5879,13 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
 // Upstream's radio command set (CommonRadioPrefs::handleCommand), same syntax and replies, on
 // meshcomod's NodePrefs. Settings that have no field here answer "unsupported" rather than an
 // "OK" that would not survive a reboot.
-bool MyMesh::handleRadioCommand(const char* command, char* reply) {
+bool MyMesh::handleRadioCommand(const char* command, char* reply, size_t reply_size) {
 #ifdef WADAMESH_RXPS
   if (strcmp(command, "get radio.rxps") == 0) {
     auto rxps = rxpsFromPrefs(_prefs);
     normalizeRxPowerSavingConfig(&rxps, s_rxps_active_sf, s_rxps_active_bw,
         rxPowerSavingCaptureCost(&radio_driver), rxPowerSavingTransition(&radio_driver));
-    RXPowerSavingCLI::get(&rxps, &radio_driver, s_rxps_active_sf, s_rxps_active_bw, reply, 158);
+    RXPowerSavingCLI::get(&rxps, &radio_driver, s_rxps_active_sf, s_rxps_active_bw, reply, reply_size);
     return true;
   }
   if (strncmp(command, "set radio.rxps ", 15) == 0) {
@@ -5886,7 +5893,7 @@ bool MyMesh::handleRadioCommand(const char* command, char* reply) {
     auto rxps = original;
     radio_driver.radioAcquire();
     bool ok = RXPowerSavingCLI::set(command + 15, s_rxps_active_sf, s_rxps_active_bw,
-                                    &rxps, &radio_driver, reply, 158);
+                                    &rxps, &radio_driver, reply, reply_size);
     if (!ok) applyRxPowerSavingConfig(&original, s_rxps_active_sf, s_rxps_active_bw, &radio_driver);
     radio_driver.radioRelease();
     if (ok) {
