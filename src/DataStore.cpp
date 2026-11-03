@@ -464,6 +464,17 @@ void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs, double& no
     memset(_prefs.default_scope_key, 0, sizeof(_prefs.default_scope_key));
     file.read((uint8_t *)_prefs.default_scope_name, sizeof(_prefs.default_scope_name));    // 90
     file.read((uint8_t *)_prefs.default_scope_key, sizeof(_prefs.default_scope_key));      // 121
+    // Optional versioned suffix. Old installations retain the constructor defaults.
+    uint8_t rxps[16];
+    if (file.read(rxps, sizeof(rxps)) == sizeof(rxps) &&
+        memcmp(rxps, "RXP1", 4) == 0 && rxps[4] <= 1 &&
+        rxps[5] <= 10 && (rxps[6] == 0 || rxps[6] == 16 || rxps[6] == 32)) {
+      _prefs.rxps_enabled = rxps[4];
+      _prefs.rxps_level = rxps[5];
+      _prefs.rxps_preamble = rxps[6];
+      memcpy(&_prefs.rxps_rx_us, rxps + 8, 4);
+      memcpy(&_prefs.rxps_sleep_us, rxps + 12, 4);
+    }
 
     file.close();
 
@@ -522,10 +533,15 @@ bool DataStore::savePrefs(const NodePrefs& _prefs, double node_lat, double node_
     file.write((uint8_t *)&_prefs.autoadd_max_hops, sizeof(_prefs.autoadd_max_hops));       // 91
     file.write((uint8_t *)&_prefs.rx_boosted_gain, sizeof(_prefs.rx_boosted_gain));         // 92
     file.write((uint8_t *)_prefs.default_scope_name, sizeof(_prefs.default_scope_name));    // 93
-    size_t last = file.write((uint8_t *)_prefs.default_scope_key, sizeof(_prefs.default_scope_key)); // 125
+    size_t scope_written = file.write((uint8_t *)_prefs.default_scope_key, sizeof(_prefs.default_scope_key)); // 125
+    uint8_t rxps[16] = {'R', 'X', 'P', '1', _prefs.rxps_enabled,
+                        _prefs.rxps_level, _prefs.rxps_preamble, 0};
+    memcpy(rxps + 8, &_prefs.rxps_rx_us, 4);
+    memcpy(rxps + 12, &_prefs.rxps_sleep_us, 4);
+    size_t last = file.write(rxps, sizeof(rxps));
 
     file.close();
-    if (last != sizeof(_prefs.default_scope_key)) {
+    if (scope_written != sizeof(_prefs.default_scope_key) || last != sizeof(rxps)) {
       _fs->remove(_rp("/new_prefs.tmp"));   // short write (storage full?) — keep the old main file
       return false;
     }

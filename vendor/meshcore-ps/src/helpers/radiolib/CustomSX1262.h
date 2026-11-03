@@ -1,0 +1,178 @@
+#pragma once
+
+#include <RadioLib.h>
+#include "MeshCore.h"
+
+class CustomSX1262 : public SX1262 {
+  uint32_t _preambleMillis = 66;
+  uint32_t _maxPayloadMillis = 3934;
+  uint32_t _activityAt = 0;
+  bool _headerSeen = false;
+
+  public:
+    CustomSX1262(Module *mod) : SX1262(mod) { }
+
+  #ifdef RP2040_PLATFORM
+    bool std_init(SPIClassRP2040* spi = NULL)
+  #else
+    bool std_init(SPIClass* spi = NULL)
+  #endif
+    {
+  #ifdef SX126X_DIO3_TCXO_VOLTAGE
+      float tcxo = SX126X_DIO3_TCXO_VOLTAGE;
+  #else
+      float tcxo = 1.6f;
+  #endif
+
+  #ifdef LORA_CR
+      uint8_t cr = LORA_CR;
+  #else
+      uint8_t cr = 5;
+  #endif
+
+  #ifdef SX126X_USE_REGULATOR_LDO
+      constexpr bool useRegulatorLDO = SX126X_USE_REGULATOR_LDO;
+  #else
+      constexpr bool useRegulatorLDO = false;
+  #endif
+
+      MESH_DEBUG_PRINTLN("SX1262 regulator requested: %s", useRegulatorLDO ? "LDO" : "DC-DC");
+
+  #if defined(P_LORA_SCLK)
+    #ifdef NRF52_PLATFORM
+      if (spi) { spi->setPins(P_LORA_MISO, P_LORA_SCLK, P_LORA_MOSI); spi->begin(); }
+    #elif defined(RP2040_PLATFORM)
+      if (spi) {
+        spi->setMISO(P_LORA_MISO);
+        //spi->setCS(P_LORA_NSS); // Setting CS results in freeze
+        spi->setSCK(P_LORA_SCLK);
+        spi->setMOSI(P_LORA_MOSI);
+        spi->begin();
+      }
+    #else
+      if (spi) spi->begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
+    #endif
+  #endif
+      int status = begin(LORA_FREQ, LORA_BW, LORA_SF, cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, LORA_TX_POWER, 16, tcxo, useRegulatorLDO);
+      // if radio init fails with -707/-706, try again with tcxo voltage set to 0.0f
+      if (status == RADIOLIB_ERR_SPI_CMD_FAILED || status == RADIOLIB_ERR_SPI_CMD_INVALID) {
+        MESH_DEBUG_PRINTLN("SX1262 init failed with error %d, retrying with TCXO at 0.0V", status);
+        tcxo = 0.0f;
+        status = begin(LORA_FREQ, LORA_BW, LORA_SF, cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, LORA_TX_POWER, 16, tcxo, useRegulatorLDO);
+      }
+      if (status != RADIOLIB_ERR_NONE) {
+        Serial.print("ERROR: radio init failed: ");
+        Serial.println(status);
+        return false;  // fail
+      }
+    
+      setCRC(1);
+  
+  #ifdef SX126X_CURRENT_LIMIT
+      setCurrentLimit(SX126X_CURRENT_LIMIT);
+  #endif
+  #ifdef SX126X_DIO2_AS_RF_SWITCH
+      setDio2AsRfSwitch(SX126X_DIO2_AS_RF_SWITCH);
+  #endif
+  #ifdef SX126X_RX_BOOSTED_GAIN
+      setRxBoostedGainMode(SX126X_RX_BOOSTED_GAIN);
+  #endif
+  #if defined(SX126X_RXEN) || defined(SX126X_TXEN)
+    #ifndef SX126X_RXEN
+      #define SX126X_RXEN RADIOLIB_NC
+    #endif
+    #ifndef SX126X_TXEN
+      #define SX126X_TXEN RADIOLIB_NC
+    #endif
+      setRfSwitchPins(SX126X_RXEN, SX126X_TXEN);
+  #endif 
+
+  // for improved RX with Heltec v4
+  #ifdef SX126X_REGISTER_PATCH
+    uint8_t r_data = 0;
+    readRegister(0x8B5, &r_data, 1);
+    r_data |= 0x01;
+    writeRegister(0x8B5, &r_data, 1);
+  #endif
+
+      MESH_DEBUG_PRINTLN("SX1262 status=0x%02X device_errors=0x%04X", getStatus(), getDeviceErrors());
+
+      return true;  // success
+    }
+
+    int16_t startReceiveDutyCycle(uint32_t rxPeriod, uint32_t sleepPeriod,
+                                  RadioLibIrqFlags_t irqFlags = RADIOLIB_IRQ_RX_DEFAULT_FLAGS,
+                                  RadioLibIrqFlags_t irqMask = RADIOLIB_IRQ_RX_DEFAULT_MASK) {
+      int16_t state = SX1262::startReceiveDutyCycle(rxPeriod, sleepPeriod, irqFlags, irqMask);
+      if (state == RADIOLIB_ERR_NONE) {
+        // RadioLib stages RX through standby, which leaves a host-controlled
+        // RXEN switch in IDLE. Set it back to RX for the whole duty-cycle;
+        // boards without an external RXEN table are unaffected.
+        this->mod->setRfSwitchState(Module::MODE_RX);
+      }
+      return state;
+    }
+
+    bool isChipBusy() {
+      uint32_t busy = this->mod->getGpio();
+      return busy != RADIOLIB_NC && this->mod->hal->digitalRead(busy);
+    }
+
+    int16_t stopRTC() {
+      uint8_t rtcStop = 0x00;
+      int16_t state = writeRegister(RADIOLIB_SX126X_REG_RTC_CTRL, &rtcStop, 1);
+      RADIOLIB_ASSERT(state);
+
+      uint8_t rtcEvent = 0;
+      state = readRegister(RADIOLIB_SX126X_REG_EVENT_MASK, &rtcEvent, 1);
+      RADIOLIB_ASSERT(state);
+
+      rtcEvent |= 0x02;
+      return writeRegister(RADIOLIB_SX126X_REG_EVENT_MASK, &rtcEvent, 1);
+    }
+
+    // The mesh uses LoRa throughout. RadioLib's generic getTimeOnAir()
+    // queries the modem over SPI, which can disturb an armed duty cycle.
+    RadioLibTime_t loraTimeOnAir(size_t len) {
+      DataRate_t rate = {};
+      rate.lora.codingRate = codingRate < 5 ? codingRate + 4 : (codingRate == 7 ? 8 : codingRate);
+      rate.lora.spreadingFactor = spreadingFactor;
+      rate.lora.bandwidth = bandwidthKhz;
+      PacketConfig_t packet = {};
+      packet.lora.preambleLength = preambleLengthLoRa;
+      packet.lora.crcEnabled = crcTypeLoRa != 0;
+      packet.lora.implicitHeader = headerType == RADIOLIB_SX126X_LORA_HEADER_IMPLICIT;
+      packet.lora.ldrOptimize = ldrOptimize != 0;
+      return calculateTimeOnAir(RADIOLIB_MODEM_LORA, rate, packet, len);
+    }
+
+    uint32_t dutyCycleTransitionUs() const { return tcxoDelay + 1000; }
+
+    bool isReceiving() {
+      // 1.16 behaviour, restored: report only. The 1.17 rewrite ran its own
+      // timers and CLEARED the receive IRQ flags (preamble/header/sync-word).
+      // On a board whose DIO1 reaches no host GPIO -- the T-Display P4 wires it
+      // to an I2C expander -- polling those flags is the only way a packet is
+      // ever noticed, so wiping them made the radio permanently deaf: it could
+      // transmit, but nothing was ever received (wadamesh#253). Boards with a
+      // real DIO1 line were unaffected because their ISR had already latched
+      // RX_DONE before anything cleared it.
+      uint32_t irq = getIrqFlags();
+      return (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) || (irq & RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED);
+    }
+
+    void setPreambleMillis(uint32_t preambleMillis) {
+      _preambleMillis = preambleMillis;
+      MESH_DEBUG_PRINTLN("Set _preambleMillis=%u", _preambleMillis);
+    }
+    void setMaxPayloadMillis(uint32_t payloadMillis) {
+      _maxPayloadMillis = payloadMillis;
+      MESH_DEBUG_PRINTLN("Set _maxPayloadMillis=%u", _maxPayloadMillis);
+    }
+
+    bool getRxBoostedGainMode() {
+      uint8_t rxGain = 0;
+      readRegister(RADIOLIB_SX126X_REG_RX_GAIN, &rxGain, 1);
+      return (rxGain == RADIOLIB_SX126X_RX_GAIN_BOOSTED);
+    }
+};

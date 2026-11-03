@@ -16,6 +16,23 @@
 #include <soc/rtc_cntl_reg.h>    // RTC_CNTL_OPTION1_REG / FORCE_DOWNLOAD_BOOT (S3-only; both P4 boards lack it)
 #endif
 #endif
+#ifdef WADAMESH_RXPS
+#include <helpers/radiolib/RXPowerSaving.h>
+#include <helpers/radiolib/RXPowerSavingCLI.h>
+
+static uint8_t s_rxps_active_sf = 0;
+static float s_rxps_active_bw = 0;
+static RxPowerSavingConfig rxpsFromPrefs(const NodePrefs& p) {
+  RxPowerSavingConfig c;
+  c.enabled = p.rxps_enabled; c.level = p.rxps_level; c.preamble = p.rxps_preamble;
+  c.rx_us = p.rxps_rx_us; c.sleep_us = p.rxps_sleep_us;
+  return c;
+}
+static void rxpsToPrefs(NodePrefs& p, const RxPowerSavingConfig& c) {
+  p.rxps_enabled = c.enabled; p.rxps_level = c.level; p.rxps_preamble = c.preamble;
+  p.rxps_rx_us = c.rx_us; p.rxps_sleep_us = c.sleep_us;
+}
+#endif
 #include <helpers/AdvertDataHelpers.h>
 #include "helpers/CompanionRetryPolicy.h"
 #include "helpers/esp32/WdtHeavyGuard.h"   // eviction blob deletes are SPIFFS-GC-prone (#222)
@@ -24,6 +41,7 @@
 #include "WiFiConfig.h"
 #if defined(ESP32) && defined(HAS_TOUCH_UI)
 #include "helpers/esp32/TouchPrefsStore.h"
+#include "ui-touch/TouchSleep.h"
 #endif
 #ifdef ESP32
 #if defined(WIFI_SSID) || defined(MULTI_TRANSPORT_COMPANION)
@@ -4073,6 +4091,10 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 
   // defaults
   memset(&_prefs, 0, sizeof(_prefs));
+  _prefs.rxps_level = 6;
+  _prefs.rxps_preamble = 16;
+  _prefs.rxps_rx_us = 65625;
+  _prefs.rxps_sleep_us = 60000;
   _prefs.airtime_factor = 1.0;
   strcpy(_prefs.node_name, "NONAME");
   _prefs.freq = LORA_FREQ;
@@ -4097,6 +4119,11 @@ void MyMesh::applyRadioFromPrefs() {
   // receive drain task so it can't re-arm RX between the steps (no-op when off).
   radio_driver.radioAcquire();
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+#ifdef WADAMESH_RXPS
+  s_rxps_active_sf = _prefs.sf; s_rxps_active_bw = _prefs.bw;
+  auto rxps = rxpsFromPrefs(_prefs);
+  applyRxPowerSavingConfig(&rxps, _prefs.sf, _prefs.bw, &radio_driver);
+#endif
   radio_driver.radioRelease();
   radio_driver.setTxPower(_prefs.tx_power_dbm);
 #if defined(USE_SX1262) || defined(USE_SX1268) || defined(USE_LR1121) || defined(USE_LR2021)
@@ -4951,6 +4978,11 @@ void MyMesh::handleCmdFrame(size_t len) {
 
       radio_driver.radioAcquire();   // hold off the RX drain task mid-sequence (no-op when off)
       radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+#ifdef WADAMESH_RXPS
+      s_rxps_active_sf = _prefs.sf; s_rxps_active_bw = _prefs.bw;
+      auto rxps = rxpsFromPrefs(_prefs);
+      applyRxPowerSavingConfig(&rxps, _prefs.sf, _prefs.bw, &radio_driver);
+#endif
 #if defined(USE_SX1262) || defined(USE_SX1268) || defined(USE_LR1121) || defined(USE_LR2021) || defined(SX126X_RX_BOOSTED_GAIN)
       radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain != 0);
 #endif
@@ -5693,6 +5725,24 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     command += 3;
   }
 
+#if defined(ESP32) && defined(HAS_TOUCH_UI)
+  // Use Wadamesh's existing transport-aware idle saver for this command.
+  if (strcmp(command, "powersaving") == 0) {
+    strcpy(reply, touchSleep::enabled() ? "on" : "off");
+    return true;
+  }
+  if (strcmp(command, "powersaving on") == 0 || strcmp(command, "powersaving off") == 0) {
+    bool enabled = strcmp(command, "powersaving on") == 0;
+    if (!touchPrefsSetSleepIdle(enabled)) {
+      strcpy(reply, "Error: could not save setting");
+    } else {
+      touchSleep::setEnabled(enabled);
+      strcpy(reply, enabled ? "on" : "off");
+    }
+    return true;
+  }
+#endif
+
   if (handleRadioCommand(command, reply)) return true;
 
   // hook for variant-specific CLI processing
@@ -5823,6 +5873,35 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
 // meshcomod's NodePrefs. Settings that have no field here answer "unsupported" rather than an
 // "OK" that would not survive a reboot.
 bool MyMesh::handleRadioCommand(const char* command, char* reply) {
+#ifdef WADAMESH_RXPS
+  if (strcmp(command, "get radio.rxps") == 0) {
+    auto rxps = rxpsFromPrefs(_prefs);
+    normalizeRxPowerSavingConfig(&rxps, s_rxps_active_sf, s_rxps_active_bw,
+        rxPowerSavingCaptureCost(&radio_driver), rxPowerSavingTransition(&radio_driver));
+    RXPowerSavingCLI::get(&rxps, &radio_driver, s_rxps_active_sf, s_rxps_active_bw, reply, 158);
+    return true;
+  }
+  if (strncmp(command, "set radio.rxps ", 15) == 0) {
+    auto original = rxpsFromPrefs(_prefs);
+    auto rxps = original;
+    radio_driver.radioAcquire();
+    bool ok = RXPowerSavingCLI::set(command + 15, s_rxps_active_sf, s_rxps_active_bw,
+                                    &rxps, &radio_driver, reply, 158);
+    if (!ok) applyRxPowerSavingConfig(&original, s_rxps_active_sf, s_rxps_active_bw, &radio_driver);
+    radio_driver.radioRelease();
+    if (ok) {
+      rxpsToPrefs(_prefs, rxps);
+      if (!savePrefs()) {
+        rxpsToPrefs(_prefs, original);
+        radio_driver.radioAcquire();
+        applyRxPowerSavingConfig(&original, s_rxps_active_sf, s_rxps_active_bw, &radio_driver);
+        radio_driver.radioRelease();
+        strcpy(reply, "Error: could not save setting");
+      }
+    }
+    return true;
+  }
+#endif
   if (strcmp(command, "get radio") == 0) {
     char freq[16], bw[16];
     strcpy(freq, StrHelper::ftoa(_prefs.freq));
